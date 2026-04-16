@@ -33,6 +33,47 @@ function safeNumber(n, fallback = 0) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function defaultBranchProfile(now = new Date().toISOString()) {
+  return {
+    name: ADMIN_NAME,
+    code: 'ADMIN-01',
+    publicUrl: String(process.env.RENDER_EXTERNAL_URL || '').trim(),
+    mode: 'LOCAL',
+    description: '',
+    updatedAt: now
+  };
+}
+
+function defaultPublicationConfig(now = new Date().toISOString()) {
+  return {
+    enabled: false,
+    mirrorUrl: '',
+    authType: 'credentials',
+    apiKey: '',
+    remoteAdminUsername: 'admin',
+    remoteAdminPassword: 'admin123',
+    autoSyncEnabled: false,
+    syncIntervalSec: 60,
+    lastSyncAt: '',
+    lastSyncStatus: 'IDLE',
+    lastSyncError: '',
+    lastCommandPollAt: '',
+    lastCommandApplyAt: '',
+    updatedAt: now
+  };
+}
+
+function defaultMirrorReplica(now = new Date().toISOString()) {
+  return {
+    snapshot: null,
+    lastSnapshotAt: '',
+    lastSnapshotSource: '',
+    commands: [],
+    commandSequence: 0,
+    updatedAt: now
+  };
+}
+
 function seed() {
   const now = new Date().toISOString();
   return {
@@ -53,6 +94,9 @@ function seed() {
           readInventory: true,
           writeInventory: true
         }
+      },
+      notifications: {
+        whatsappRestockNumber: ''
       }
     },
     fiscalConfig: {
@@ -109,6 +153,9 @@ function seed() {
     fiscalCustomers: [],
     invoices: [],
     branches: [],
+    branchProfile: defaultBranchProfile(now),
+    publication: defaultPublicationConfig(now),
+    mirrorReplica: defaultMirrorReplica(now),
     inventoryAdjustments: [],
     counters: {
       salesSequence: 0
@@ -269,6 +316,351 @@ function getBranchSummarySkeleton(branch) {
   };
 }
 
+function getBranchProfile(db) {
+  return {
+    ...defaultBranchProfile(),
+    ...(db.branchProfile || {})
+  };
+}
+
+function getPublicationConfig(db) {
+  return {
+    ...defaultPublicationConfig(),
+    ...(db.publication || {})
+  };
+}
+
+function getMirrorReplica(db) {
+  return {
+    ...defaultMirrorReplica(),
+    ...(db.mirrorReplica || {})
+  };
+}
+
+function getNearStockThreshold(product) {
+  const low = Math.max(0, safeNumber(product?.lowStockThreshold, 0));
+  if (low <= 0) return 0;
+  return round2(Math.max(low + (product?.allowsFraction ? 0.5 : 1), low * 1.25));
+}
+
+function getInventoryAlertStatus(product) {
+  const stock = safeNumber(product?.stock, 0);
+  const low = Math.max(0, safeNumber(product?.lowStockThreshold, 0));
+  if (low > 0 && stock <= low) return 'missing';
+  const nearThreshold = getNearStockThreshold(product);
+  if (low > 0 && stock > low && stock <= nearThreshold) return 'near';
+  return 'normal';
+}
+
+function enrichInventoryRow(product = {}) {
+  const alertStatus = getInventoryAlertStatus(product);
+  return {
+    ...product,
+    alertStatus,
+    nearStockThreshold: getNearStockThreshold(product)
+  };
+}
+
+function filterInventoryRows(rows = [], filters = {}) {
+  const query = String(filters.query || '').trim().toLowerCase();
+  const category = String(filters.category || '').trim().toLowerCase();
+  const alertMode = String(filters.alertMode || (String(filters.lowOnly || '').trim() === '1' ? 'attention' : 'all')).trim().toLowerCase();
+  let result = (Array.isArray(rows) ? rows : []).map(enrichInventoryRow);
+
+  if (query) {
+    result = result.filter((product) => [product.name, product.sku, product.category].some((value) => String(value || '').toLowerCase().includes(query)));
+  }
+  if (category) {
+    result = result.filter((product) => String(product.category || '').trim().toLowerCase() === category);
+  }
+  if (alertMode === 'missing') {
+    result = result.filter((product) => product.alertStatus === 'missing');
+  } else if (alertMode === 'near') {
+    result = result.filter((product) => product.alertStatus === 'near');
+  } else if (alertMode === 'attention') {
+    result = result.filter((product) => product.alertStatus === 'missing' || product.alertStatus === 'near');
+  }
+
+  result.sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'es'));
+  return result;
+}
+
+function buildInventoryPayloadFromRows(rows = [], filters = {}) {
+  const enrichedRows = (Array.isArray(rows) ? rows : []).map(enrichInventoryRow);
+  const allCategories = Array.from(new Set(enrichedRows.map((product) => String(product.category || '').trim()).filter(Boolean))).sort((a, b) => a.localeCompare(b, 'es'));
+  const filtered = filterInventoryRows(enrichedRows, filters);
+  const missingCount = filtered.filter((product) => product.alertStatus === 'missing').length;
+  const nearCount = filtered.filter((product) => product.alertStatus === 'near').length;
+  return {
+    ok: true,
+    products: filtered,
+    categories: allCategories,
+    totals: {
+      products: filtered.length,
+      stockUnits: round2(filtered.reduce((acc, product) => acc + safeNumber(product.stock), 0)),
+      lowStockCount: missingCount,
+      missingCount,
+      nearStockCount: nearCount,
+      attentionCount: missingCount + nearCount
+    },
+    generatedAt: new Date().toISOString()
+  };
+}
+
+function buildRemoteSales(db, filters = {}) {
+  const limit = Math.max(1, Math.min(200, safeNumber(filters.limit, 50)));
+  const q = String(filters.query || '').trim().toLowerCase();
+  const employee = String(filters.employee || '').trim().toLowerCase();
+  let rows = (db.sales || []).slice().sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  if (q) {
+    rows = rows.filter((sale) => {
+      const haystack = [sale.folio, sale.customerName, sale.customerReference, sale.operatorName, sale.employeeNumber, sale.terminalCode]
+        .map((value) => String(value || '').toLowerCase()).join(' ');
+      return haystack.includes(q);
+    });
+  }
+  if (employee) {
+    rows = rows.filter((sale) => [sale.operatorName, sale.employeeNumber]
+      .some((value) => String(value || '').toLowerCase().includes(employee)));
+  }
+  const selected = rows.slice(0, limit);
+  return {
+    ok: true,
+    filters: { limit, query: q, employee },
+    totals: {
+      count: selected.length,
+      amount: round2(selected.reduce((acc, sale) => acc + safeNumber(sale.total), 0))
+    },
+    sales: selected.map((sale) => ({
+      id: sale.id,
+      folio: sale.folio,
+      createdAt: sale.createdAt,
+      total: sale.total,
+      operatorName: sale.operatorName || '',
+      employeeNumber: sale.employeeNumber || '',
+      customerName: sale.customerName || '',
+      customerReference: sale.customerReference || '',
+      terminalCode: sale.terminalCode || '',
+      itemsCount: Array.isArray(sale.items) ? sale.items.length : 0,
+      items: Array.isArray(sale.items) ? sale.items.map((item) => ({
+        name: item.name,
+        quantity: item.quantity,
+        unit: item.unit || '',
+        unitPrice: item.unitPrice,
+        total: round2(safeNumber(item.quantity) * safeNumber(item.unitPrice))
+      })) : []
+    })),
+    generatedAt: new Date().toISOString()
+  };
+}
+
+function buildRemoteEmployeeReport(db, filters = {}) {
+  const { range = 'day', anchorDate = '', from = '', to = '' } = filters || {};
+  let start;
+  let end;
+  if (from && to) {
+    start = parseDateInput(from, new Date());
+    end = parseDateInput(to, new Date());
+    end.setDate(end.getDate() + 1);
+  } else {
+    ({ start, end } = getRangeBounds(range, anchorDate));
+  }
+
+  const salesInRange = (db.sales || []).filter((sale) => {
+    const d = new Date(sale.createdAt);
+    return d >= start && d < end;
+  });
+
+  const map = new Map();
+  for (const sale of salesInRange) {
+    const key = sale.operatorId || `${sale.employeeNumber || ''}-${sale.operatorName || 'SIN_OPERADOR'}`;
+    if (!map.has(key)) {
+      map.set(key, {
+        operatorId: sale.operatorId || '',
+        name: sale.operatorName || 'Sin asignar',
+        employeeNumber: sale.employeeNumber || '',
+        salesCount: 0,
+        total: 0
+      });
+    }
+    const row = map.get(key);
+    row.salesCount += 1;
+    row.total = round2(row.total + safeNumber(sale.total));
+  }
+
+  const rows = Array.from(map.values()).sort((a, b) => b.total - a.total);
+  return {
+    ok: true,
+    range,
+    from: start.toISOString(),
+    to: end.toISOString(),
+    totals: {
+      salesCount: rows.reduce((acc, row) => acc + safeNumber(row.salesCount), 0),
+      total: round2(rows.reduce((acc, row) => acc + safeNumber(row.total), 0))
+    },
+    rows,
+    generatedAt: new Date().toISOString()
+  };
+}
+
+function buildRemoteStockAlerts(db) {
+  const rows = (db.products || []).filter((product) => product.active !== false).map(sanitizeInventoryProduct).map(enrichInventoryRow);
+  const missing = rows.filter((product) => product.alertStatus === 'missing');
+  const near = rows.filter((product) => product.alertStatus === 'near');
+  return {
+    ok: true,
+    totals: {
+      missingCount: missing.length,
+      nearStockCount: near.length,
+      attentionCount: missing.length + near.length
+    },
+    missing,
+    near,
+    generatedAt: new Date().toISOString()
+  };
+}
+
+function buildSyncSnapshot(db) {
+  const profile = getBranchProfile(db);
+  const summary = buildRemoteSummary(db, { profile, serviceMode: 'LOCAL_ADMIN' });
+  const inventory = buildInventoryPayloadFromRows((db.products || []).filter((product) => product.active !== false).map(sanitizeInventoryProduct), {});
+  const sales = buildRemoteSales(db, { limit: 50 });
+  const employeeReport = buildRemoteEmployeeReport(db, { range: 'day' });
+  const stockAlerts = buildRemoteStockAlerts(db);
+  return {
+    branchProfile: profile,
+    summary,
+    inventory,
+    sales,
+    employeeReport,
+    stockAlerts,
+    sentAt: new Date().toISOString(),
+    sourceAdminName: ADMIN_NAME,
+    sourceHostname: os.hostname()
+  };
+}
+
+function getEffectiveRemoteSummary(db) {
+  const replica = getMirrorReplica(db);
+  if (replica.snapshot?.summary) {
+    const payload = JSON.parse(JSON.stringify(replica.snapshot.summary));
+    payload.branchProfile = replica.snapshot.branchProfile || payload.branchProfile || getBranchProfile(db);
+    payload.remote = {
+      ...(payload.remote || {}),
+      serviceMode: 'REMOTE_MIRROR',
+      mirrorUpdatedAt: replica.lastSnapshotAt || replica.snapshot.sentAt || '',
+      permissions: getRemotePermissions(db)
+    };
+    payload.generatedAt = replica.snapshot.sentAt || payload.generatedAt || new Date().toISOString();
+    return payload;
+  }
+  return buildRemoteSummary(db, { profile: getBranchProfile(db), serviceMode: 'LOCAL_ADMIN' });
+}
+
+function getEffectiveRemoteInventory(db, filters = {}) {
+  const replica = getMirrorReplica(db);
+  if (replica.snapshot?.inventory?.products) {
+    return buildInventoryPayloadFromRows(replica.snapshot.inventory.products, filters);
+  }
+  return buildRemoteInventory(db, filters);
+}
+
+function getEffectiveRemoteSales(db, filters = {}) {
+  const replica = getMirrorReplica(db);
+  if (replica.snapshot?.sales) {
+    const payload = JSON.parse(JSON.stringify(replica.snapshot.sales));
+    payload.generatedAt = replica.lastSnapshotAt || replica.snapshot.sentAt || payload.generatedAt || new Date().toISOString();
+    return payload;
+  }
+  return buildRemoteSales(db, filters);
+}
+
+function getEffectiveRemoteEmployeeReport(db, filters = {}) {
+  const replica = getMirrorReplica(db);
+  if (replica.snapshot?.employeeReport) {
+    const payload = JSON.parse(JSON.stringify(replica.snapshot.employeeReport));
+    payload.generatedAt = replica.lastSnapshotAt || replica.snapshot.sentAt || payload.generatedAt || new Date().toISOString();
+    return payload;
+  }
+  return buildRemoteEmployeeReport(db, filters);
+}
+
+function getEffectiveRemoteStockAlerts(db) {
+  const replica = getMirrorReplica(db);
+  if (replica.snapshot?.stockAlerts) {
+    const payload = JSON.parse(JSON.stringify(replica.snapshot.stockAlerts));
+    payload.generatedAt = replica.lastSnapshotAt || replica.snapshot.sentAt || payload.generatedAt || new Date().toISOString();
+    return payload;
+  }
+  if (replica.snapshot?.inventory?.products) {
+    const rows = (replica.snapshot.inventory.products || []).map(enrichInventoryRow);
+    return {
+      ok: true,
+      totals: {
+        missingCount: rows.filter((product) => product.alertStatus === 'missing').length,
+        nearStockCount: rows.filter((product) => product.alertStatus === 'near').length,
+        attentionCount: rows.filter((product) => product.alertStatus !== 'normal').length
+      },
+      missing: rows.filter((product) => product.alertStatus === 'missing'),
+      near: rows.filter((product) => product.alertStatus === 'near'),
+      generatedAt: replica.lastSnapshotAt || replica.snapshot.sentAt || new Date().toISOString()
+    };
+  }
+  return buildRemoteStockAlerts(db);
+}
+
+function queueMirrorInventoryCommand(db, payload = {}) {
+  db.mirrorReplica ||= defaultMirrorReplica();
+  db.mirrorReplica.commands ||= [];
+  db.mirrorReplica.commandSequence = safeNumber(db.mirrorReplica.commandSequence, 0) + 1;
+  const command = {
+    id: uuidv4(),
+    sequence: db.mirrorReplica.commandSequence,
+    commandType: 'INVENTORY_ADJUST',
+    productId: payload.productId,
+    operation: payload.operation === 'set' ? 'set' : (payload.operation === 'subtract' ? 'subtract' : 'add'),
+    quantity: round2(safeNumber(payload.quantity)),
+    targetStock: payload.targetStock !== undefined ? round2(safeNumber(payload.targetStock)) : null,
+    reason: String(payload.reason || '').trim() || 'Ajuste remoto de inventario',
+    actorName: String(payload.actorName || '').trim() || 'Administrador maestro',
+    actorUsername: String(payload.actorUsername || '').trim() || 'admin',
+    actorBranch: String(payload.actorBranch || '').trim(),
+    status: 'PENDING',
+    createdAt: new Date().toISOString(),
+    acknowledgedAt: ''
+  };
+  db.mirrorReplica.commands.push(command);
+  db.mirrorReplica.commands = db.mirrorReplica.commands.slice(-500);
+  db.mirrorReplica.updatedAt = new Date().toISOString();
+  return command;
+}
+
+function applyMirrorCommandBatch(db, commands = []) {
+  const applied = [];
+  const failed = [];
+  for (const command of Array.isArray(commands) ? commands : []) {
+    try {
+      if (command.commandType === 'INVENTORY_ADJUST') {
+        const result = applyInventoryAdjustment(db, {
+          productId: command.productId,
+          operation: command.operation,
+          quantity: command.quantity,
+          targetStock: command.targetStock,
+          reason: command.reason,
+          sourceType: 'REMOTE_MIRROR_COMMAND',
+          actorName: command.actorName,
+          actorUsername: command.actorUsername,
+          actorBranch: command.actorBranch
+        });
+        applied.push({ commandId: command.id, productId: result.product.id, movement: result.movement });
+      }
+    } catch (err) {
+      failed.push({ commandId: command.id, message: err.message });
+    }
+  }
+  return { applied, failed };
+}
+
 function normalizeTicketItems(items = []) {
   return (Array.isArray(items) ? items : []).map((item) => ({
     productId: item.productId,
@@ -285,7 +677,7 @@ function sumTicket(items = []) {
 }
 
 function isLowStock(product) {
-  return safeNumber(product.stock) <= safeNumber(product.lowStockThreshold);
+  return getInventoryAlertStatus(product) === 'missing';
 }
 
 function ensureDb() {
@@ -298,7 +690,12 @@ function ensureDb() {
   let changed = false;
 
   db.users ||= seed().users;
-  db.security ||= { requireAdminPasswordForEdits: true, updatedAt: new Date().toISOString(), remoteAccess: {} };
+  db.security ||= { requireAdminPasswordForEdits: true, updatedAt: new Date().toISOString(), remoteAccess: {}, notifications: {} };
+  db.security.notifications ||= {};
+  if (typeof db.security.notifications.whatsappRestockNumber !== 'string') {
+    db.security.notifications.whatsappRestockNumber = '';
+    changed = true;
+  }
   db.security.remoteAccess ||= {};
   if (!db.security.remoteAccess.apiKey) {
     db.security.remoteAccess.apiKey = `REMOTE-${uuidv4().replace(/-/g, '').slice(0, 24).toUpperCase()}`;
@@ -321,6 +718,10 @@ function ensureDb() {
     db.security.remoteAccess.permissions.writeInventory = true;
     changed = true;
   }
+  if (typeof db.security.remoteAccess.permissions.syncBridge !== 'boolean') {
+    db.security.remoteAccess.permissions.syncBridge = true;
+    changed = true;
+  }
   db.fiscalConfig ||= seed().fiscalConfig;
   db.products ||= [];
   db.openTickets ||= [];
@@ -329,6 +730,9 @@ function ensureDb() {
   db.fiscalCustomers ||= [];
   db.invoices ||= [];
   db.branches ||= [];
+  db.branchProfile ||= defaultBranchProfile();
+  db.publication ||= defaultPublicationConfig();
+  db.mirrorReplica ||= defaultMirrorReplica();
   db.inventoryAdjustments ||= [];
   db.counters ||= { salesSequence: 0 };
   db.terminals ||= seed().terminals;
@@ -394,6 +798,54 @@ function ensureDb() {
     }
     return migrated;
   });
+
+
+  const migratedBranchProfile = {
+    ...defaultBranchProfile(),
+    ...(db.branchProfile || {})
+  };
+  migratedBranchProfile.name = String(migratedBranchProfile.name || ADMIN_NAME).trim() || ADMIN_NAME;
+  migratedBranchProfile.code = String(migratedBranchProfile.code || 'ADMIN-01').trim() || 'ADMIN-01';
+  migratedBranchProfile.publicUrl = String(migratedBranchProfile.publicUrl || '').trim();
+  migratedBranchProfile.mode = String(migratedBranchProfile.mode || 'LOCAL').trim() || 'LOCAL';
+  migratedBranchProfile.description = String(migratedBranchProfile.description || '').trim();
+  migratedBranchProfile.updatedAt = migratedBranchProfile.updatedAt || new Date().toISOString();
+  if (JSON.stringify(db.branchProfile || {}) !== JSON.stringify(migratedBranchProfile)) changed = true;
+  db.branchProfile = migratedBranchProfile;
+
+  const migratedPublication = {
+    ...defaultPublicationConfig(),
+    ...(db.publication || {})
+  };
+  migratedPublication.enabled = migratedPublication.enabled === true;
+  migratedPublication.mirrorUrl = String(migratedPublication.mirrorUrl || '').trim().replace(/\/$/, '');
+  migratedPublication.authType = migratedPublication.authType === 'token' ? 'token' : 'credentials';
+  migratedPublication.apiKey = String(migratedPublication.apiKey || '').trim();
+  migratedPublication.remoteAdminUsername = String(migratedPublication.remoteAdminUsername || 'admin').trim() || 'admin';
+  migratedPublication.remoteAdminPassword = String(migratedPublication.remoteAdminPassword || '').trim();
+  migratedPublication.autoSyncEnabled = migratedPublication.autoSyncEnabled === true;
+  migratedPublication.syncIntervalSec = Math.max(15, Math.min(600, safeNumber(migratedPublication.syncIntervalSec, 60)));
+  migratedPublication.lastSyncAt = String(migratedPublication.lastSyncAt || '').trim();
+  migratedPublication.lastSyncStatus = String(migratedPublication.lastSyncStatus || 'IDLE').trim() || 'IDLE';
+  migratedPublication.lastSyncError = String(migratedPublication.lastSyncError || '').trim();
+  migratedPublication.lastCommandPollAt = String(migratedPublication.lastCommandPollAt || '').trim();
+  migratedPublication.lastCommandApplyAt = String(migratedPublication.lastCommandApplyAt || '').trim();
+  migratedPublication.updatedAt = migratedPublication.updatedAt || new Date().toISOString();
+  if (JSON.stringify(db.publication || {}) !== JSON.stringify(migratedPublication)) changed = true;
+  db.publication = migratedPublication;
+
+  const migratedMirrorReplica = {
+    ...defaultMirrorReplica(),
+    ...(db.mirrorReplica || {})
+  };
+  migratedMirrorReplica.snapshot = migratedMirrorReplica.snapshot || null;
+  migratedMirrorReplica.lastSnapshotAt = String(migratedMirrorReplica.lastSnapshotAt || '').trim();
+  migratedMirrorReplica.lastSnapshotSource = String(migratedMirrorReplica.lastSnapshotSource || '').trim();
+  migratedMirrorReplica.commands = Array.isArray(migratedMirrorReplica.commands) ? migratedMirrorReplica.commands : [];
+  migratedMirrorReplica.commandSequence = safeNumber(migratedMirrorReplica.commandSequence, 0);
+  migratedMirrorReplica.updatedAt = migratedMirrorReplica.updatedAt || new Date().toISOString();
+  if (JSON.stringify(db.mirrorReplica || {}) !== JSON.stringify(migratedMirrorReplica)) changed = true;
+  db.mirrorReplica = migratedMirrorReplica;
 
 
   db.products = db.products.map((p) => {
@@ -543,7 +995,8 @@ function getRemotePermissions(db) {
   return {
     readSummary: db.security?.remoteAccess?.permissions?.readSummary !== false,
     readInventory: db.security?.remoteAccess?.permissions?.readInventory !== false,
-    writeInventory: db.security?.remoteAccess?.permissions?.writeInventory !== false
+    writeInventory: db.security?.remoteAccess?.permissions?.writeInventory !== false,
+    syncBridge: db.security?.remoteAccess?.permissions?.syncBridge !== false
   };
 }
 
@@ -600,46 +1053,15 @@ function sanitizeInventoryProduct(product) {
     costPrice: round2(safeNumber(product.costPrice)),
     imageUrl: product.imageUrl || '',
     active: product.active !== false,
-    updatedAt: product.updatedAt || ''
+    updatedAt: product.updatedAt || '',
+    alertStatus: getInventoryAlertStatus(product),
+    nearStockThreshold: getNearStockThreshold(product)
   };
 }
 
 function buildRemoteInventory(db, filters = {}) {
-  const query = String(filters.query || '').trim().toLowerCase();
-  const category = String(filters.category || '').trim().toLowerCase();
-  const lowOnly = String(filters.lowOnly || '').trim() === '1';
-
   const allProducts = (db.products || []).filter((product) => product.active !== false).map(sanitizeInventoryProduct);
-  const allCategories = Array.from(new Set(allProducts.map((product) => String(product.category || '').trim()).filter(Boolean))).sort((a, b) => a.localeCompare(b, 'es'));
-  let rows = allProducts.slice();
-
-  if (query) {
-    rows = rows.filter((product) => {
-      return [product.name, product.sku, product.category].some((value) => String(value || '').toLowerCase().includes(query));
-    });
-  }
-
-  if (category) {
-    rows = rows.filter((product) => String(product.category || '').trim().toLowerCase() === category);
-  }
-
-  if (lowOnly) {
-    rows = rows.filter((product) => safeNumber(product.stock) <= safeNumber(product.lowStockThreshold));
-  }
-
-  rows.sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'es'));
-
-  return {
-    ok: true,
-    products: rows,
-    categories: allCategories,
-    totals: {
-      products: rows.length,
-      stockUnits: round2(rows.reduce((acc, product) => acc + safeNumber(product.stock), 0)),
-      lowStockCount: rows.filter((product) => safeNumber(product.stock) <= safeNumber(product.lowStockThreshold)).length
-    },
-    generatedAt: new Date().toISOString()
-  };
+  return buildInventoryPayloadFromRows(allProducts, filters);
 }
 
 function applyInventoryAdjustment(db, payload = {}) {
@@ -694,15 +1116,28 @@ function applyInventoryAdjustment(db, payload = {}) {
   return { product, movement };
 }
 
-function buildRemoteSummary(db) {
+function buildRemoteSummary(db, options = {}) {
+  const profile = options.profile || getBranchProfile(db);
+  const serviceMode = options.serviceMode || 'LOCAL_ADMIN';
   const totalSales = round2((db.sales || []).reduce((a, s) => a + safeNumber(s.total), 0));
-  const lowStockProducts = (db.products || []).filter(isLowStock).slice(0, 8).map((product) => ({
+  const lowStockProducts = (db.products || []).filter((product) => getInventoryAlertStatus(product) === 'missing').slice(0, 8).map((product) => ({
     id: product.id,
     name: product.name,
     sku: product.sku || '',
     stock: safeNumber(product.stock),
     unit: product.unit || 'PZA',
-    threshold: safeNumber(product.lowStockThreshold)
+    threshold: safeNumber(product.lowStockThreshold),
+    alertStatus: 'missing'
+  }));
+  const nearStockProducts = (db.products || []).filter((product) => getInventoryAlertStatus(product) === 'near').slice(0, 8).map((product) => ({
+    id: product.id,
+    name: product.name,
+    sku: product.sku || '',
+    stock: safeNumber(product.stock),
+    unit: product.unit || 'PZA',
+    threshold: safeNumber(product.lowStockThreshold),
+    nearThreshold: getNearStockThreshold(product),
+    alertStatus: 'near'
   }));
   const recentSales = (db.sales || []).slice().sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()).slice(0, 8).map((sale) => ({
     id: sale.id,
@@ -725,11 +1160,14 @@ function buildRemoteSummary(db) {
 
   return {
     ok: true,
+    branchProfile: profile,
     remote: {
       adminName: ADMIN_NAME,
       hostname: os.hostname(),
       port: PORT,
       service: 'embedded-admin-backend',
+      serviceMode,
+      publicUrl: profile.publicUrl || '',
       permissions: getRemotePermissions(db)
     },
     metrics: {
@@ -738,13 +1176,16 @@ function buildRemoteSummary(db) {
       salesCount: (db.sales || []).length,
       totalSales,
       employees: getActiveEmployees(db).length,
-      lowStockCount: (db.products || []).filter(isLowStock).length,
+      lowStockCount: (db.products || []).filter((product) => getInventoryAlertStatus(product) === 'missing').length,
+      nearStockCount: (db.products || []).filter((product) => getInventoryAlertStatus(product) === 'near').length,
+      attentionCount: (db.products || []).filter((product) => getInventoryAlertStatus(product) !== 'normal').length,
       openTickets: (db.openTickets || []).length,
       invoices: (db.invoices || []).length,
       inventoryAdjustments: (db.inventoryAdjustments || []).length
     },
     recentSales,
     lowStockProducts,
+    nearStockProducts,
     recentInventoryAdjustments,
     generatedAt: new Date().toISOString()
   };
@@ -786,15 +1227,24 @@ async function fetchRemoteBranch(branch, endpointPath, options = {}) {
   const timeout = setTimeout(() => controller.abort(), 10000);
 
   try {
-    const response = await fetch(`${base}${endpointPath}`, {
+    const url = new URL(`${base}${endpointPath}`);
+    if ((options.method || 'GET').toUpperCase() === 'GET') {
+      url.searchParams.set('_ts', String(Date.now()));
+    }
+    const response = await fetch(url.toString(), {
       method: options.method || 'GET',
       headers,
       body: options.body,
-      signal: controller.signal
+      signal: controller.signal,
+      cache: 'no-store'
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) {
-      throw new Error(data.message || `La sucursal respondió con HTTP ${response.status}`);
+      const err = new Error(data.message || `La sucursal respondió con HTTP ${response.status}`);
+      err.status = response.status;
+      err.payload = data;
+      err.endpointPath = endpointPath;
+      throw err;
     }
     return data;
   } finally {
@@ -802,8 +1252,103 @@ async function fetchRemoteBranch(branch, endpointPath, options = {}) {
   }
 }
 
+function normalizeRemoteStockAlertsPayload(payload = {}, source = 'stock-alerts') {
+  const rawMissing = Array.isArray(payload.missing)
+    ? payload.missing
+    : (Array.isArray(payload.lowStockProducts)
+      ? payload.lowStockProducts
+      : (Array.isArray(payload.products) ? payload.products.filter((row) => row.alertStatus === 'missing') : []));
+  const rawNear = Array.isArray(payload.near)
+    ? payload.near
+    : (Array.isArray(payload.nearStockProducts)
+      ? payload.nearStockProducts
+      : (Array.isArray(payload.products) ? payload.products.filter((row) => row.alertStatus === 'near') : []));
+
+  const mapRow = (row = {}, forcedStatus = '') => ({
+    id: row.id,
+    name: row.name || row.productName || '-',
+    sku: row.sku || '',
+    stock: round2(safeNumber(row.stock)),
+    unit: row.unit || 'PZA',
+    lowStockThreshold: round2(safeNumber(row.lowStockThreshold, row.threshold)),
+    allowsFraction: row.allowsFraction !== false && ['KG', 'LT'].includes(String(row.unit || '').toUpperCase()),
+    alertStatus: forcedStatus || row.alertStatus || 'normal'
+  });
+
+  const missing = rawMissing.map((row) => mapRow(row, 'missing'));
+  const near = rawNear.map((row) => mapRow(row, 'near'));
+
+  return {
+    ok: true,
+    missing,
+    near,
+    totals: {
+      missingCount: payload.totals?.missingCount ?? missing.length,
+      nearStockCount: payload.totals?.nearStockCount ?? near.length
+    },
+    generatedAt: payload.generatedAt || new Date().toISOString(),
+    source
+  };
+}
+
+function normalizeRemotePublicationInfoPayload(payload = {}, source = 'publication-info') {
+  const branchProfile = payload.branchProfile || {};
+  const remote = payload.remote || {};
+  return {
+    ok: true,
+    branchProfile,
+    remote: {
+      adminName: remote.adminName || ADMIN_NAME,
+      hostname: remote.hostname || os.hostname(),
+      port: remote.port || PORT,
+      service: remote.service || 'embedded-admin-backend',
+      serviceMode: remote.serviceMode || 'LOCAL_ADMIN',
+      publicUrl: remote.publicUrl || branchProfile.publicUrl || '',
+      permissions: remote.permissions || getRemotePermissions(readDb())
+    },
+    lastSnapshotAt: payload.lastSnapshotAt || '',
+    authMode: payload.authMode || '',
+    source
+  };
+}
+
+async function fetchRemoteBranchWithFallbacks(branch, attempts = []) {
+  let lastError = null;
+  for (const attempt of attempts) {
+    const config = typeof attempt === 'string' ? { path: attempt } : (attempt || {});
+    try {
+      const data = await fetchRemoteBranch(branch, config.path, config.options || {});
+      return typeof config.transform === 'function'
+        ? config.transform(data, config.path)
+        : data;
+    } catch (err) {
+      lastError = err;
+      const fallbackOn = config.fallbackOn || [];
+      if (!fallbackOn.includes(err.status)) {
+        throw err;
+      }
+    }
+  }
+  throw lastError || new Error('No se pudo consultar la sucursal remota');
+}
+
 async function fetchRemoteBranchSummary(branch) {
   return fetchRemoteBranch(branch, '/api/remote/summary');
+}
+
+async function fetchRemoteBranchPublicationInfo(branch) {
+  return fetchRemoteBranchWithFallbacks(branch, [
+    { path: '/api/remote/publication-info' },
+    { path: '/api/remote/summary', fallbackOn: [404, 405], transform: (data) => normalizeRemotePublicationInfoPayload(data, 'summary-fallback') }
+  ]);
+}
+
+async function fetchRemoteBranchStockAlerts(branch) {
+  return fetchRemoteBranchWithFallbacks(branch, [
+    { path: '/api/remote/stock-alerts', transform: (data) => normalizeRemoteStockAlertsPayload(data, 'stock-alerts') },
+    { path: '/api/remote/summary', fallbackOn: [404, 405], transform: (data) => normalizeRemoteStockAlertsPayload(data, 'summary-fallback') },
+    { path: '/api/remote/inventory?alertMode=attention', fallbackOn: [404, 405], transform: (data) => normalizeRemoteStockAlertsPayload(data, 'inventory-fallback') }
+  ]);
 }
 
 function touchTerminal(db, payload = {}) {
@@ -870,8 +1415,42 @@ function emitTickets(db, reason = 'TICKETS_SYNC', extra = {}) {
   });
 }
 
+app.get('/', (_req, res) => {
+  res.type('text/plain').send(`Cremería El Güero · Backend remoto activo\nHealth: /health`);
+});
+
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'embedded-lan-backend', port: PORT, adminName: ADMIN_NAME, hostname: os.hostname() });
+  const db = readDb();
+  res.json({
+    ok: true,
+    service: 'embedded-lan-backend',
+    port: PORT,
+    adminName: ADMIN_NAME,
+    hostname: os.hostname(),
+    branchProfile: getBranchProfile(db),
+    mirrorUpdatedAt: getMirrorReplica(db).lastSnapshotAt || ''
+  });
+});
+
+app.get('/api/remote/publication-info', (req, res) => {
+  const db = readDb();
+  const remoteAuth = authorizeRemoteRequest(req, res, db, 'readSummary');
+  if (!remoteAuth) return;
+  const replica = getMirrorReplica(db);
+  return res.json({
+    ok: true,
+    branchProfile: replica.snapshot?.branchProfile || getBranchProfile(db),
+    remote: {
+      adminName: ADMIN_NAME,
+      hostname: os.hostname(),
+      port: PORT,
+      service: 'embedded-admin-backend',
+      serviceMode: replica.snapshot ? 'REMOTE_MIRROR' : 'LOCAL_ADMIN',
+      permissions: getRemotePermissions(db)
+    },
+    lastSnapshotAt: replica.lastSnapshotAt || '',
+    authMode: remoteAuth.authMode
+  });
 });
 
 app.get('/api/remote/summary', (req, res) => {
@@ -879,7 +1458,7 @@ app.get('/api/remote/summary', (req, res) => {
   const remoteAuth = authorizeRemoteRequest(req, res, db, 'readSummary');
   if (!remoteAuth) return;
 
-  const payload = buildRemoteSummary(db);
+  const payload = getEffectiveRemoteSummary(db);
   payload.authMode = remoteAuth.authMode;
   return res.json(payload);
 });
@@ -889,9 +1468,45 @@ app.get('/api/remote/inventory', (req, res) => {
   const remoteAuth = authorizeRemoteRequest(req, res, db, 'readInventory');
   if (!remoteAuth) return;
 
-  const payload = buildRemoteInventory(db, req.query || {});
+  const payload = getEffectiveRemoteInventory(db, req.query || {});
   payload.authMode = remoteAuth.authMode;
   payload.permissions = remoteAuth.permissions;
+  return res.json(payload);
+});
+
+app.get('/api/remote/sales', (req, res) => {
+  const db = readDb();
+  const remoteAuth = authorizeRemoteRequest(req, res, db, 'readSummary');
+  if (!remoteAuth) return;
+  const payload = getEffectiveRemoteSales(db, req.query || {});
+  payload.authMode = remoteAuth.authMode;
+  return res.json(payload);
+});
+
+app.get('/api/remote/employee-report', (req, res) => {
+  const db = readDb();
+  const remoteAuth = authorizeRemoteRequest(req, res, db, 'readSummary');
+  if (!remoteAuth) return;
+  const payload = getEffectiveRemoteEmployeeReport(db, req.query || {});
+  payload.authMode = remoteAuth.authMode;
+  return res.json(payload);
+});
+
+app.get('/api/remote/stock-alerts', (req, res) => {
+  const db = readDb();
+  const remoteAuth = authorizeRemoteRequest(req, res, db, 'readInventory');
+  if (!remoteAuth) return;
+  const payload = getEffectiveRemoteStockAlerts(db);
+  payload.authMode = remoteAuth.authMode;
+  return res.json(payload);
+});
+
+app.get('/api/remote/alerts', (req, res) => {
+  const db = readDb();
+  const remoteAuth = authorizeRemoteRequest(req, res, db, 'readInventory');
+  if (!remoteAuth) return;
+  const payload = getEffectiveRemoteStockAlerts(db);
+  payload.authMode = remoteAuth.authMode;
   return res.json(payload);
 });
 
@@ -901,6 +1516,18 @@ app.post('/api/remote/inventory/adjust', (req, res) => {
   if (!remoteAuth) return;
 
   try {
+    const replica = getMirrorReplica(db);
+    if (replica.snapshot?.inventory?.products) {
+      const command = queueMirrorInventoryCommand(db, {
+        ...req.body,
+        actorName: req.body?.actorName || remoteAuth.actorName,
+        actorUsername: req.body?.actorUsername || remoteAuth.actorUsername,
+        actorBranch: String(req.body?.actorBranch || '').trim()
+      });
+      writeDb(db);
+      return res.json({ ok: true, queued: true, command, message: 'Ajuste remoto enviado a la sucursal para aplicarse en la siguiente sincronización.' });
+    }
+
     const result = applyInventoryAdjustment(db, {
       ...req.body,
       sourceType: 'REMOTE_ADMIN',
@@ -914,6 +1541,48 @@ app.post('/api/remote/inventory/adjust', (req, res) => {
   } catch (err) {
     return res.status(400).json({ ok: false, message: err.message });
   }
+});
+
+app.post('/api/remote/snapshot/push', (req, res) => {
+  const db = readDb();
+  const remoteAuth = authorizeRemoteRequest(req, res, db, 'syncBridge');
+  if (!remoteAuth) return;
+  const snapshot = req.body?.snapshot || null;
+  if (!snapshot?.summary || !snapshot?.inventory) {
+    return res.status(400).json({ ok: false, message: 'Snapshot remoto inválido' });
+  }
+  db.mirrorReplica ||= defaultMirrorReplica();
+  db.mirrorReplica.snapshot = snapshot;
+  db.mirrorReplica.lastSnapshotAt = new Date().toISOString();
+  db.mirrorReplica.lastSnapshotSource = String(snapshot?.branchProfile?.name || remoteAuth.actorName || '').trim();
+  db.mirrorReplica.updatedAt = new Date().toISOString();
+  writeDb(db);
+  return res.json({ ok: true, receivedAt: db.mirrorReplica.lastSnapshotAt, pendingCommands: (db.mirrorReplica.commands || []).filter((row) => row.status === 'PENDING').length });
+});
+
+app.get('/api/remote/commands/pull', (req, res) => {
+  const db = readDb();
+  const remoteAuth = authorizeRemoteRequest(req, res, db, 'syncBridge');
+  if (!remoteAuth) return;
+  const pending = (db.mirrorReplica?.commands || []).filter((row) => row.status === 'PENDING');
+  return res.json({ ok: true, commands: pending, generatedAt: new Date().toISOString() });
+});
+
+app.post('/api/remote/commands/ack', (req, res) => {
+  const db = readDb();
+  const remoteAuth = authorizeRemoteRequest(req, res, db, 'syncBridge');
+  if (!remoteAuth) return;
+  const ids = new Set(Array.isArray(req.body?.commandIds) ? req.body.commandIds.map(String) : []);
+  db.mirrorReplica ||= defaultMirrorReplica();
+  db.mirrorReplica.commands = (db.mirrorReplica.commands || []).map((command) => {
+    if (ids.has(String(command.id))) {
+      return { ...command, status: 'ACKNOWLEDGED', acknowledgedAt: new Date().toISOString() };
+    }
+    return command;
+  }).slice(-500);
+  db.mirrorReplica.updatedAt = new Date().toISOString();
+  writeDb(db);
+  return res.json({ ok: true, acknowledged: ids.size });
 });
 
 app.post('/auth/login', (req, res) => {
@@ -1475,7 +2144,8 @@ app.get('/api/security/admin', auth, requireAdmin, (_req, res) => {
       requireAdminPasswordForEdits: db.security?.requireAdminPasswordForEdits !== false,
       remoteApiKey: db.security?.remoteAccess?.apiKey || '',
       allowRemoteAdminCredentials: db.security?.remoteAccess?.allowAdminCredentials !== false,
-      allowRemoteInventoryWrite: db.security?.remoteAccess?.permissions?.writeInventory !== false
+      allowRemoteInventoryWrite: db.security?.remoteAccess?.permissions?.writeInventory !== false,
+      restockWhatsappNumber: db.security?.notifications?.whatsappRestockNumber || ''
     }
   });
 });
@@ -1490,7 +2160,8 @@ app.post('/api/security/admin', auth, requireAdmin, (req, res) => {
     requireAdminPasswordForEdits,
     remoteApiKey,
     allowRemoteAdminCredentials,
-    allowRemoteInventoryWrite
+    allowRemoteInventoryWrite,
+    restockWhatsappNumber
   } = req.body || {};
   const db = readDb();
   const admin = db.users.find((u) => u.role === 'ADMIN');
@@ -1526,8 +2197,12 @@ app.post('/api/security/admin', auth, requireAdmin, (req, res) => {
       permissions: {
         readSummary: true,
         readInventory: true,
-        writeInventory: allowRemoteInventoryWrite !== false
+        writeInventory: allowRemoteInventoryWrite !== false,
+        syncBridge: true
       }
+    },
+    notifications: {
+      whatsappRestockNumber: String(restockWhatsappNumber || '').trim()
     },
     updatedAt: new Date().toISOString()
   };
@@ -1541,9 +2216,133 @@ app.post('/api/security/admin', auth, requireAdmin, (req, res) => {
       requireAdminPasswordForEdits: db.security.requireAdminPasswordForEdits !== false,
       remoteApiKey: db.security?.remoteAccess?.apiKey || '',
       allowRemoteAdminCredentials: db.security?.remoteAccess?.allowAdminCredentials !== false,
-      allowRemoteInventoryWrite: db.security?.remoteAccess?.permissions?.writeInventory !== false
+      allowRemoteInventoryWrite: db.security?.remoteAccess?.permissions?.writeInventory !== false,
+      restockWhatsappNumber: db.security?.notifications?.whatsappRestockNumber || ''
     }
   });
+});
+
+
+app.get('/api/branch-profile', auth, requireAdmin, (_req, res) => {
+  const db = readDb();
+  res.json({
+    ok: true,
+    profile: getBranchProfile(db),
+    publication: getPublicationConfig(db),
+    mirror: {
+      lastSnapshotAt: getMirrorReplica(db).lastSnapshotAt || '',
+      pendingCommands: (getMirrorReplica(db).commands || []).filter((row) => row.status === 'PENDING').length
+    }
+  });
+});
+
+app.post('/api/branch-profile', auth, requireAdmin, (req, res) => {
+  const db = readDb();
+  const body = req.body || {};
+  const currentProfile = getBranchProfile(db);
+  const currentPublication = getPublicationConfig(db);
+  db.branchProfile = {
+    ...currentProfile,
+    name: String(body.name || currentProfile.name || ADMIN_NAME).trim() || ADMIN_NAME,
+    code: String(body.code || currentProfile.code || 'ADMIN-01').trim() || 'ADMIN-01',
+    publicUrl: String(body.publicUrl || currentProfile.publicUrl || '').trim().replace(/\/$/, ''),
+    mode: String(body.mode || currentProfile.mode || 'LOCAL').trim() || 'LOCAL',
+    description: String(body.description || currentProfile.description || '').trim(),
+    updatedAt: new Date().toISOString()
+  };
+  db.publication = {
+    ...currentPublication,
+    enabled: body.enabled === true,
+    mirrorUrl: String(body.mirrorUrl || currentPublication.mirrorUrl || '').trim().replace(/\/$/, ''),
+    authType: body.authType === 'token' ? 'token' : 'credentials',
+    apiKey: String(body.apiKey || currentPublication.apiKey || '').trim(),
+    remoteAdminUsername: String(body.remoteAdminUsername || currentPublication.remoteAdminUsername || 'admin').trim() || 'admin',
+    remoteAdminPassword: String(body.remoteAdminPassword || currentPublication.remoteAdminPassword || '').trim(),
+    autoSyncEnabled: body.autoSyncEnabled === true,
+    syncIntervalSec: Math.max(15, Math.min(600, safeNumber(body.syncIntervalSec, currentPublication.syncIntervalSec || 60))),
+    lastSyncAt: currentPublication.lastSyncAt || '',
+    lastSyncStatus: currentPublication.lastSyncStatus || 'IDLE',
+    lastSyncError: currentPublication.lastSyncError || '',
+    lastCommandPollAt: currentPublication.lastCommandPollAt || '',
+    lastCommandApplyAt: currentPublication.lastCommandApplyAt || '',
+    updatedAt: new Date().toISOString()
+  };
+  writeDb(db);
+  return res.json({ ok: true, profile: db.branchProfile, publication: db.publication });
+});
+
+app.post('/api/branch-profile/test-publication', auth, requireAdmin, async (_req, res) => {
+  const db = readDb();
+  const publication = getPublicationConfig(db);
+  try {
+    if (!publication.mirrorUrl) throw new Error('La URL del espejo remoto está vacía');
+    const info = await fetchRemoteBranch({
+      remoteUrl: publication.mirrorUrl,
+      authType: publication.authType,
+      apiKey: publication.apiKey,
+      remoteAdminUsername: publication.remoteAdminUsername,
+      remoteAdminPassword: publication.remoteAdminPassword
+    }, '/api/remote/publication-info');
+    return res.json({ ok: true, remote: info });
+  } catch (err) {
+    return res.status(502).json({ ok: false, message: `No se pudo validar la publicación remota: ${err.message}` });
+  }
+});
+
+app.post('/api/branch-profile/sync-now', auth, requireAdmin, async (_req, res) => {
+  const db = readDb();
+  const publication = getPublicationConfig(db);
+  if (!publication.enabled) {
+    return res.status(400).json({ ok: false, message: 'La publicación remota está deshabilitada' });
+  }
+  if (!publication.mirrorUrl) {
+    return res.status(400).json({ ok: false, message: 'Falta la URL del espejo remoto' });
+  }
+
+  try {
+    const candidate = {
+      remoteUrl: publication.mirrorUrl,
+      authType: publication.authType,
+      apiKey: publication.apiKey,
+      remoteAdminUsername: publication.remoteAdminUsername,
+      remoteAdminPassword: publication.remoteAdminPassword
+    };
+    const snapshot = buildSyncSnapshot(db);
+    const pushResult = await fetchRemoteBranch(candidate, '/api/remote/snapshot/push', {
+      method: 'POST',
+      body: JSON.stringify({ snapshot })
+    });
+    const commandsResult = await fetchRemoteBranch(candidate, '/api/remote/commands/pull');
+    const batch = applyMirrorCommandBatch(db, commandsResult.commands || []);
+    let ackResult = { ok: true, acknowledged: 0 };
+    if ((batch.applied || []).length) {
+      ackResult = await fetchRemoteBranch(candidate, '/api/remote/commands/ack', {
+        method: 'POST',
+        body: JSON.stringify({ commandIds: batch.applied.map((row) => row.commandId) })
+      });
+      const refreshedSnapshot = buildSyncSnapshot(db);
+      await fetchRemoteBranch(candidate, '/api/remote/snapshot/push', {
+        method: 'POST',
+        body: JSON.stringify({ snapshot: refreshedSnapshot })
+      });
+      broadcastInventory(db, 'REMOTE_COMMANDS_APPLIED', { commandIds: batch.applied.map((row) => row.commandId) });
+    }
+    db.publication.lastSyncAt = new Date().toISOString();
+    db.publication.lastSyncStatus = 'ONLINE';
+    db.publication.lastSyncError = '';
+    db.publication.lastCommandPollAt = db.publication.lastSyncAt;
+    db.publication.lastCommandApplyAt = (batch.applied || []).length ? db.publication.lastSyncAt : (db.publication.lastCommandApplyAt || '');
+    db.publication.updatedAt = new Date().toISOString();
+    writeDb(db);
+    return res.json({ ok: true, pushResult, commandsPulled: (commandsResult.commands || []).length, applied: batch.applied || [], failed: batch.failed || [], ackResult, publication: db.publication });
+  } catch (err) {
+    db.publication.lastSyncAt = new Date().toISOString();
+    db.publication.lastSyncStatus = 'ERROR';
+    db.publication.lastSyncError = err.message;
+    db.publication.updatedAt = new Date().toISOString();
+    writeDb(db);
+    return res.status(502).json({ ok: false, message: `No se pudo sincronizar la sucursal con su espejo remoto: ${err.message}`, publication: db.publication });
+  }
 });
 
 
@@ -1708,6 +2507,119 @@ app.post('/api/branches/:id/inventory/adjust', auth, requireAdmin, async (req, r
     branch.lastError = err.message;
     writeDb(db);
     return res.status(502).json({ ok: false, message: `No se pudo ajustar el inventario remoto: ${err.message}` });
+  }
+});
+
+app.get('/api/branches/:id/session/connect', auth, requireAdmin, async (req, res) => {
+  const db = readDb();
+  const branch = (db.branches || []).find((b) => b.id === req.params.id);
+  if (!branch) return res.status(404).json({ ok: false, message: 'Sucursal no encontrada' });
+  try {
+    const data = await fetchRemoteBranchPublicationInfo(branch);
+    branch.lastStatus = 'ONLINE';
+    branch.lastCheckedAt = new Date().toISOString();
+    branch.lastError = '';
+    writeDb(db);
+    return res.json({ ok: true, branch: getBranchSummarySkeleton(branch), remote: data });
+  } catch (err) {
+    branch.lastStatus = 'OFFLINE';
+    branch.lastCheckedAt = new Date().toISOString();
+    branch.lastError = err.message;
+    writeDb(db);
+    return res.status(502).json({ ok: false, message: `No se pudo conectar con la sucursal: ${err.message}` });
+  }
+});
+
+app.get('/api/branches/:id/session/sales', auth, requireAdmin, async (req, res) => {
+  const db = readDb();
+  const branch = (db.branches || []).find((b) => b.id === req.params.id);
+  if (!branch) return res.status(404).json({ ok: false, message: 'Sucursal no encontrada' });
+  try {
+    const params = new URLSearchParams();
+    if (req.query?.limit) params.set('limit', String(req.query.limit));
+    if (req.query?.query) params.set('query', String(req.query.query));
+    if (req.query?.employee) params.set('employee', String(req.query.employee));
+    const data = await fetchRemoteBranch(branch, `/api/remote/sales${params.toString() ? `?${params.toString()}` : ''}`);
+    branch.lastStatus = 'ONLINE';
+    branch.lastCheckedAt = new Date().toISOString();
+    branch.lastError = '';
+    writeDb(db);
+    return res.json({ ok: true, branch: getBranchSummarySkeleton(branch), session: data });
+  } catch (err) {
+    branch.lastStatus = 'OFFLINE';
+    branch.lastCheckedAt = new Date().toISOString();
+    branch.lastError = err.message;
+    writeDb(db);
+    return res.status(502).json({ ok: false, message: `No se pudieron consultar las ventas remotas: ${err.message}` });
+  }
+});
+
+app.get('/api/branches/:id/session/inventory', auth, requireAdmin, async (req, res) => {
+  const db = readDb();
+  const branch = (db.branches || []).find((b) => b.id === req.params.id);
+  if (!branch) return res.status(404).json({ ok: false, message: 'Sucursal no encontrada' });
+  try {
+    const params = new URLSearchParams();
+    if (req.query?.query) params.set('query', String(req.query.query));
+    if (req.query?.category) params.set('category', String(req.query.category));
+    if (req.query?.alertMode) params.set('alertMode', String(req.query.alertMode));
+    const data = await fetchRemoteBranch(branch, `/api/remote/inventory${params.toString() ? `?${params.toString()}` : ''}`);
+    branch.lastStatus = 'ONLINE';
+    branch.lastCheckedAt = new Date().toISOString();
+    branch.lastError = '';
+    writeDb(db);
+    return res.json({ ok: true, branch: getBranchSummarySkeleton(branch), session: data });
+  } catch (err) {
+    branch.lastStatus = 'OFFLINE';
+    branch.lastCheckedAt = new Date().toISOString();
+    branch.lastError = err.message;
+    writeDb(db);
+    return res.status(502).json({ ok: false, message: `No se pudo consultar el inventario remoto: ${err.message}` });
+  }
+});
+
+app.get('/api/branches/:id/session/employee-report', auth, requireAdmin, async (req, res) => {
+  const db = readDb();
+  const branch = (db.branches || []).find((b) => b.id === req.params.id);
+  if (!branch) return res.status(404).json({ ok: false, message: 'Sucursal no encontrada' });
+  try {
+    const params = new URLSearchParams();
+    if (req.query?.range) params.set('range', String(req.query.range));
+    if (req.query?.anchorDate) params.set('anchorDate', String(req.query.anchorDate));
+    if (req.query?.from) params.set('from', String(req.query.from));
+    if (req.query?.to) params.set('to', String(req.query.to));
+    const data = await fetchRemoteBranch(branch, `/api/remote/employee-report${params.toString() ? `?${params.toString()}` : ''}`);
+    branch.lastStatus = 'ONLINE';
+    branch.lastCheckedAt = new Date().toISOString();
+    branch.lastError = '';
+    writeDb(db);
+    return res.json({ ok: true, branch: getBranchSummarySkeleton(branch), session: data });
+  } catch (err) {
+    branch.lastStatus = 'OFFLINE';
+    branch.lastCheckedAt = new Date().toISOString();
+    branch.lastError = err.message;
+    writeDb(db);
+    return res.status(502).json({ ok: false, message: `No se pudo consultar el reporte remoto por empleado: ${err.message}` });
+  }
+});
+
+app.get('/api/branches/:id/session/stock-alerts', auth, requireAdmin, async (req, res) => {
+  const db = readDb();
+  const branch = (db.branches || []).find((b) => b.id === req.params.id);
+  if (!branch) return res.status(404).json({ ok: false, message: 'Sucursal no encontrada' });
+  try {
+    const data = await fetchRemoteBranchStockAlerts(branch);
+    branch.lastStatus = 'ONLINE';
+    branch.lastCheckedAt = new Date().toISOString();
+    branch.lastError = '';
+    writeDb(db);
+    return res.json({ ok: true, branch: getBranchSummarySkeleton(branch), session: data });
+  } catch (err) {
+    branch.lastStatus = 'OFFLINE';
+    branch.lastCheckedAt = new Date().toISOString();
+    branch.lastError = err.message;
+    writeDb(db);
+    return res.status(502).json({ ok: false, message: `No se pudieron consultar las alertas remotas: ${err.message}` });
   }
 });
 
